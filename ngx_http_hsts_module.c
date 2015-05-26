@@ -1,46 +1,59 @@
 
-#define _GNU_SOURCE
+// _GNU_SOURCE needs to be defined for strptime to be exported.
+#ifndef _GNU_SOURCE
+# define _NO_GNU_SOURCE
+# define _GNU_SOURCE
+#endif
 #include <time.h>
+#ifdef _NO_GNU_SOURCE
+# undef _NO_GNU_SOURCE
+# undef _GNU_SOURCE
+#endif
 
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
 
 
+static char *ngx_http_hsts_config(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_hsts_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_hsts_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
 
 static ngx_int_t ngx_http_hsts_init(ngx_conf_t *cf);
-static ngx_int_t ngx_http_hsts_handler(ngx_http_request_t *r);
+
+static ngx_int_t ngx_http_hsts_header_filter(ngx_http_request_t *r);
+
+
+static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 
 
 typedef struct {
-  ngx_str_t expires;
-  time_t    expires_time;
+  time_t     expires;
+  ngx_flag_t includeSubdomains;
 } ngx_http_hsts_loc_conf_t;
 
 
 static ngx_http_module_t  ngx_http_hsts_module_ctx = {
-  NULL,                    /* preconfiguration */
-  ngx_http_hsts_init,           /* postconfiguration */
+  NULL,                           /* preconfiguration */
+  ngx_http_hsts_init,             /* postconfiguration */
 
-  NULL,                    /* create main configuration */
-  NULL,                    /* init main configuration */
+  NULL,                           /* create main configuration */
+  NULL,                           /* init main configuration */
 
-  NULL,                    /* create server configuration */
-  NULL,                    /* merge server configuration */
+  NULL,                           /* create server configuration */
+  NULL,                           /* merge server configuration */
 
-  ngx_http_hsts_create_loc_conf,                    /* create location configuration */
-  ngx_http_hsts_merge_loc_conf                     /* merge location configuration */
+  ngx_http_hsts_create_loc_conf,  /* create location configuration */
+  ngx_http_hsts_merge_loc_conf    /* merge location configuration */
 };
 
 
 static ngx_command_t ngx_http_hsts_commands[] = {
     { ngx_string("hsts"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_CONF_TAKE12,
-      ngx_conf_set_str_slot,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
+      ngx_http_hsts_config,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_hsts_loc_conf_t, expires),
+      0,
       NULL },
     ngx_null_command
 };
@@ -49,39 +62,26 @@ static ngx_command_t ngx_http_hsts_commands[] = {
 ngx_module_t  ngx_http_hsts_module = {
   NGX_MODULE_V1,
   &ngx_http_hsts_module_ctx,  /* module context */
-  ngx_http_hsts_commands,                            /* module directives */
-  NGX_HTTP_MODULE,                 /* module type */
-  NULL,                            /* init master */
-  NULL,                            /* init module */
-  NULL,                            /* init process */
-  NULL,                            /* init thread */
-  NULL,                            /* exit thread */
-  NULL,                            /* exit process */
-  NULL,                            /* exit master */
+  ngx_http_hsts_commands,     /* module directives */
+  NGX_HTTP_MODULE,            /* module type */
+  NULL,                       /* init master */
+  NULL,                       /* init module */
+  NULL,                       /* init process */
+  NULL,                       /* init thread */
+  NULL,                       /* exit thread */
+  NULL,                       /* exit process */
+  NULL,                       /* exit master */
   NGX_MODULE_V1_PADDING
 };
 
-static void *ngx_http_hsts_create_loc_conf(ngx_conf_t *cf) {
-  ngx_http_hsts_loc_conf_t *conf;
 
-  conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_hsts_loc_conf_t));
-  if (conf == NULL) {
-      return NULL;
-  }
+static char *ngx_http_hsts_config(ngx_conf_t *cf, ngx_command_t *cmd, void *confp) {
+  ngx_http_hsts_loc_conf_t* conf = confp;
+  ngx_str_t *values = cf->args->elts;
 
-  return conf;
-}
-
-
-static char *ngx_http_hsts_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child) {
-  ngx_http_hsts_loc_conf_t *prev = parent;
-  ngx_http_hsts_loc_conf_t *conf = child;
-
-  ngx_conf_merge_str_value(conf->expires, prev->expires, "")
-
-  if (conf->expires.len > 0) {
-    char* expires = malloc(conf->expires.len + 1);
-    ngx_memcpy(expires, conf->expires.data, conf->expires.len);
+  if (values[1].len > 0) {
+    char* expires = malloc(values[1].len + 1);
+    ngx_memcpy(expires, values[1].data, values[1].len);
 
     struct tm tm;
     if (strptime(expires, "%Y-%m-%d %H:%M:%S", &tm) == NULL) {
@@ -93,10 +93,19 @@ static char *ngx_http_hsts_merge_loc_conf(ngx_conf_t *cf, void *parent, void *ch
 
     free(expires);
 
-    conf->expires_time = timegm(&tm);
+    conf->expires = timegm(&tm);
 
-    if (conf->expires_time == -1) {
+    if (conf->expires == -1) {
       ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid expire date");
+      return NGX_CONF_ERROR;
+    }
+  }
+
+  if (cf->args->nelts > 2) {
+    if (ngx_strncmp("includeSubdomains", values[2].data, values[2].len) == 0) {
+      conf->includeSubdomains = 1;
+    } else {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "unknown option %*s", values[2]);
       return NGX_CONF_ERROR;
     }
   }
@@ -105,46 +114,69 @@ static char *ngx_http_hsts_merge_loc_conf(ngx_conf_t *cf, void *parent, void *ch
 }
 
 
-static ngx_int_t ngx_http_hsts_init(ngx_conf_t *cf) {
-  ngx_http_core_main_conf_t *cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-  ngx_http_handler_pt *h = ngx_array_push(&cmcf->phases[NGX_HTTP_SERVER_REWRITE_PHASE].handlers);
+static void *ngx_http_hsts_create_loc_conf(ngx_conf_t *cf) {
+  ngx_http_hsts_loc_conf_t *conf;
 
-  if (h == NULL) {
-    return NGX_ERROR;
+  conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_hsts_loc_conf_t));
+  if (conf == NULL) {
+      return NULL;
   }
+    
+  conf->expires = NGX_CONF_UNSET;
+  conf->includeSubdomains = NGX_CONF_UNSET_UINT;
 
-  *h = ngx_http_hsts_handler;
+  return conf;
+}
+
+
+static char *ngx_http_hsts_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child) {
+  ngx_http_hsts_loc_conf_t *prev = parent;
+  ngx_http_hsts_loc_conf_t *conf = child;
+
+  ngx_conf_merge_value(conf->expires, prev->expires, 0);
+  ngx_conf_merge_value(conf->includeSubdomains, prev->includeSubdomains, 0);
+
+  return NGX_CONF_OK;
+}
+
+
+static ngx_int_t ngx_http_hsts_init(ngx_conf_t *cf) {
+  ngx_http_next_header_filter = ngx_http_top_header_filter;
+  ngx_http_top_header_filter = ngx_http_hsts_header_filter;
 
   return NGX_OK;
 }
 
-static ngx_int_t ngx_http_hsts_handler(ngx_http_request_t *r) {
-  if (r->internal) {
-    return NGX_DECLINED;
+
+static ngx_int_t ngx_http_hsts_header_filter(ngx_http_request_t *r) {
+  if (r->connection->ssl == NULL) {
+    return ngx_http_next_header_filter(r);
+  }
+
+  ngx_http_hsts_loc_conf_t *conf = ngx_http_get_module_loc_conf(r, ngx_http_hsts_module);
+
+  if (conf->expires == 0) {
+    return ngx_http_next_header_filter(r);
   }
 
   ngx_table_elt_t* h = ngx_list_push(&r->headers_out.headers);
 
   if (h == NULL) {
-    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    return ngx_http_next_header_filter(r);
   }
 
-  ngx_http_hsts_loc_conf_t *conf = ngx_http_get_module_loc_conf(r, ngx_http_hsts_module);
-
-  if (conf->expires_time == 0) {
-    return NGX_DECLINED;
-  }
-
-  char *val = ngx_palloc(r->pool, 32);
+  // 40 is enought, see:
+  // echo -n "max-age=2147483648; includeSubdomains" | wc -c
+  char *val = ngx_palloc(r->pool, 40);
   if (val == NULL) {
-    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    return ngx_http_next_header_filter(r);
   }
 
-  size_t hvallen = snprintf(val, 32, "max-age=%ld; includeSubdomains", conf->expires_time - time(0));
+  size_t hvallen = snprintf(val, 40, "max-age=%ld%s", conf->expires - time(0), conf->includeSubdomains ? "; includeSubdomains" : "");
 
   ngx_table_elt_t *info_header = ngx_list_push(&r->headers_out.headers);
   if (info_header == NULL) {
-    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    return ngx_http_next_header_filter(r);
   }
 
   info_header->hash = 1;
@@ -156,6 +188,6 @@ static ngx_int_t ngx_http_hsts_handler(ngx_http_request_t *r) {
 
   info_header->value = hval;
 
-  return NGX_DECLINED;
+  return ngx_http_next_header_filter(r);
 }
 
