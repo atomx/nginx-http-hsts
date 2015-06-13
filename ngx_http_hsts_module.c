@@ -30,6 +30,7 @@ static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 typedef struct {
   time_t     expires;
   ngx_flag_t includeSubdomains;
+  ngx_flag_t preload;
 } ngx_http_hsts_loc_conf_t;
 
 
@@ -50,7 +51,7 @@ static ngx_http_module_t  ngx_http_hsts_module_ctx = {
 
 static ngx_command_t ngx_http_hsts_commands[] = {
     { ngx_string("hsts"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
       ngx_http_hsts_config,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
@@ -76,34 +77,43 @@ ngx_module_t  ngx_http_hsts_module = {
 
 
 static char *ngx_http_hsts_config(ngx_conf_t *cf, ngx_command_t *cmd, void *confp) {
+  ngx_uint_t i;
   ngx_http_hsts_loc_conf_t* conf = confp;
   ngx_str_t *values = cf->args->elts;
 
   if (values[1].len > 0) {
-    char* expires = malloc(values[1].len + 1);
-    ngx_memcpy(expires, values[1].data, values[1].len);
+    if (ngx_strncmp("off", values[1].data, values[1].len) == 0) {
+      conf->expires = 0;
+    } else {
+      struct tm tm;
 
-    struct tm tm;
-    if (strptime(expires, "%Y-%m-%d %H:%M:%S", &tm) == NULL) {
-      free(expires);
+      // Make sure the string is long enough for strptime in case it's not null terminated.
+      if (values[1].len < strlen("2015-05-29")) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid expire date");
+        return NGX_CONF_ERROR;
+      }
 
-      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid expire date");
-      return NGX_CONF_ERROR;
-    }
+      ngx_memzero(&tm, sizeof(tm));
 
-    free(expires);
+      if (strptime((char*)values[1].data, "%Y-%m-%d", &tm) == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid expire date");
+        return NGX_CONF_ERROR;
+      }
 
-    conf->expires = timegm(&tm);
+      conf->expires = timegm(&tm);
 
-    if (conf->expires == -1) {
-      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid expire date");
-      return NGX_CONF_ERROR;
+      if (conf->expires == -1) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid expire date");
+        return NGX_CONF_ERROR;
+      }
     }
   }
 
-  if (cf->args->nelts > 2) {
-    if (ngx_strncmp("includeSubdomains", values[2].data, values[2].len) == 0) {
+  for (i = 2; i < cf->args->nelts; i++) {
+    if (ngx_strncmp("includeSubdomains", values[i].data, values[i].len) == 0) {
       conf->includeSubdomains = 1;
+    } else if (ngx_strncmp("preload", values[i].data, values[i].len) == 0) {
+      conf->preload = 1;
     } else {
       ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "unknown option %*s", values[2]);
       return NGX_CONF_ERROR;
@@ -121,9 +131,10 @@ static void *ngx_http_hsts_create_loc_conf(ngx_conf_t *cf) {
   if (conf == NULL) {
       return NULL;
   }
-    
+
   conf->expires = NGX_CONF_UNSET;
   conf->includeSubdomains = NGX_CONF_UNSET_UINT;
+  conf->preload = NGX_CONF_UNSET_UINT;
 
   return conf;
 }
@@ -135,6 +146,7 @@ static char *ngx_http_hsts_merge_loc_conf(ngx_conf_t *cf, void *parent, void *ch
 
   ngx_conf_merge_value(conf->expires, prev->expires, 0);
   ngx_conf_merge_value(conf->includeSubdomains, prev->includeSubdomains, 0);
+  ngx_conf_merge_value(conf->preload, prev->preload, 0);
 
   return NGX_CONF_OK;
 }
@@ -159,34 +171,32 @@ static ngx_int_t ngx_http_hsts_header_filter(ngx_http_request_t *r) {
     return ngx_http_next_header_filter(r);
   }
 
-  ngx_table_elt_t* h = ngx_list_push(&r->headers_out.headers);
-
-  if (h == NULL) {
-    return ngx_http_next_header_filter(r);
-  }
-
-  // 40 is enought, see:
-  // echo -n "max-age=2147483648; includeSubdomains" | wc -c
-  char *val = ngx_palloc(r->pool, 40);
+  // 64 is enough, see:
+  // echo -n "max-age=2147483648; includeSubdomains; preload" | wc -c
+  u_char *val = ngx_pnalloc(r->pool, 64);
   if (val == NULL) {
-    return ngx_http_next_header_filter(r);
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  size_t hvallen = snprintf(val, 40, "max-age=%ld%s", conf->expires - time(0), conf->includeSubdomains ? "; includeSubdomains" : "");
+  u_char *p = ngx_snprintf(
+    val,
+    64,
+    "max-age=%l%s%s",
+    conf->expires - time(NULL),
+    conf->includeSubdomains ? "; includeSubdomains" : "",
+    conf->preload ? "; preload" : ""
+  );
 
-  ngx_table_elt_t *info_header = ngx_list_push(&r->headers_out.headers);
-  if (info_header == NULL) {
-    return ngx_http_next_header_filter(r);
+  ngx_table_elt_t *h = ngx_list_push(&r->headers_out.headers);
+  if (h == NULL) {
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  info_header->hash = 1;
-  ngx_str_set(&info_header->key, "Strict-Transport-Security");
+  h->hash = 1;
+  ngx_str_set(&h->key, "Strict-Transport-Security");
 
-  ngx_str_t hval;
-  hval.len = hvallen;
-  hval.data = (u_char*)val;
-
-  info_header->value = hval;
+  h->value.len = p - val;
+  h->value.data = (u_char*)val;
 
   return ngx_http_next_header_filter(r);
 }
